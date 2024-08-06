@@ -109,6 +109,13 @@ metadata:
   name: imperative-sa
   namespace: imperative
 ---
+# Source: clustergroup/templates/imperative/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: imperative-admin-sa
+  namespace: imperative
+---
 # Source: clustergroup/templates/imperative/configmap.yaml
 apiVersion: v1
 kind: ConfigMap
@@ -218,8 +225,38 @@ data:
       argoCD:
         configManagementPlugins: []
         initContainers: []
+        resourceExclusions: |
+          - apiGroups:
+            - tekton.dev
+            kinds:
+            - TaskRun
+            - PipelineRun
+        resourceHealthChecks:
+        - check: |
+            hs = {}
+            if obj.status ~= nil then
+              if obj.status.phase ~= nil then
+                if obj.status.phase == "Pending" then
+                  hs.status = "Healthy"
+                  hs.message = obj.status.phase
+                  return hs
+                elseif obj.status.phase == "Bound" then
+                  hs.status = "Healthy"
+                  hs.message = obj.status.phase
+                  return hs
+                end
+              end
+            end
+            hs.status = "Progressing"
+            hs.message = "Waiting for PVC"
+            return hs
+          kind: PersistentVolumeClaim
+        resourceTrackingMethod: label
       imperative:
         activeDeadlineSeconds: 3600
+        adminClusterRoleName: imperative-admin-cluster-role
+        adminServiceAccountCreate: true
+        adminServiceAccountName: imperative-admin-sa
         clusterRoleName: imperative-cluster-role
         clusterRoleYaml: ""
         cronJobName: imperative-cronjob
@@ -260,6 +297,7 @@ data:
       - staging
       - vault
       - golang-external-secrets
+      nodes: []
       projects:
       - hub
       - medical-diagnosis
@@ -301,6 +339,8 @@ data:
         useCSV: false
       pattern: mypattern
       repoURL: https://github.com/pattern-clone/mypattern
+      secretStore:
+        backend: vault
       targetRevision: main
     main:
       clusterGroupName: hub
@@ -312,6 +352,25 @@ data:
     secretStore:
       kind: ClusterSecretStore
       name: vault-backend
+---
+# Source: clustergroup/templates/imperative/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trusted-ca-bundle
+  namespace: imperative
+  annotations:
+  labels:
+    config.openshift.io/inject-trusted-cabundle: 'true'
+---
+# Source: clustergroup/templates/plumbing/trusted-bundle-ca-configmap.yaml
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: trusted-ca-bundle
+  namespace: mypattern-hub
+  labels:
+    config.openshift.io/inject-trusted-cabundle: 'true'
 ---
 # Source: clustergroup/templates/imperative/clusterrole.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -328,11 +387,24 @@ rules:
     - list
     - watch
 ---
+# Source: clustergroup/templates/imperative/clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: imperative-admin-cluster-role
+rules:
+  - apiGroups:
+    - '*'
+    resources:
+    - '*'
+    verbs:
+    - '*'
+---
 # Source: clustergroup/templates/imperative/rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: imperative-cluster-admin-rolebinding
+  name: imperative-cluster-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -342,12 +414,30 @@ subjects:
     name: imperative-sa
     namespace: imperative
 ---
+# Source: clustergroup/templates/imperative/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: imperative-admin-clusterrolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: imperative-admin-cluster-role
+subjects:
+  - kind: ServiceAccount
+    name: imperative-admin-sa
+    namespace: imperative
+---
 # Source: clustergroup/templates/plumbing/argocd-super-role.yaml
 # WARNING: ONLY USE THIS FOR MANAGING CLUSTERS NOT FOR REGULAR USERS
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: openshift-gitops-cluster-admin-rolebinding
+  # We need to have this before anything else or the sync might get stuck forever
+  # due to permission issues
+  annotations:
+    argocd.argoproj.io/sync-wave: "-100"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -367,6 +457,10 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: mypattern-hub-cluster-admin-rolebinding
+  # We need to have this before anything else or the sync might get stuck forever
+  # due to permission issues
+  annotations:
+    argocd.argoproj.io/sync-wave: "-100"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -404,7 +498,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: imperative-admin-rolebinding
+  name: imperative-rolebinding
   namespace: imperative
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -436,12 +530,38 @@ spec:
           initContainers:
             # git init happens in /git/repo so that we can set the folder to 0770 permissions
             # reason for that is ansible refuses to create temporary folders in there            
+            - name: fetch-ca
+              image: registry.redhat.io/ansible-automation-platform-24/ee-supported-rhel9:latest
+              imagePullPolicy: Always
+              env:
+                - name: HOME
+                  value: /git/home
+              command:
+              - 'sh'
+              - '-c'
+              - >-
+                cat /var/run/kube-root-ca/ca.crt /var/run/trusted-ca/ca-bundle.crt /var/run/trusted-hub/hub-kube-root-ca.crt > /tmp/ca-bundles/ca-bundle.crt || true;
+                ls -l /tmp/ca-bundles/
+              volumeMounts:
+              - mountPath: /var/run/kube-root-ca
+                name: kube-root-ca
+              - mountPath: /var/run/trusted-ca
+                name: trusted-ca-bundle
+              - mountPath: /var/run/trusted-hub
+                name: trusted-hub-bundle
+              - mountPath: /tmp/ca-bundles
+                name: ca-bundles            
             - name: git-init
               image: registry.redhat.io/ansible-automation-platform-24/ee-supported-rhel9:latest
               imagePullPolicy: Always
               env:
                 - name: HOME
                   value: /git/home
+              volumeMounts:
+              - name: git
+                mountPath: "/git"
+              - name: ca-bundles
+                mountPath: /etc/pki/tls/certs
               command:
               - 'sh'
               - '-c'
@@ -453,7 +573,6 @@ spec:
                     U="$(oc get secret -n openshift-gitops vp-private-repo-credentials -o go-template='{{index .data.username | base64decode }}')";
                     P="$(oc get secret -n openshift-gitops vp-private-repo-credentials -o go-template='{{index .data.password | base64decode }}')";
                     URL=$(echo https://github.com/pattern-clone/mypattern | sed -E "s/(https?:\/\/)/\1${U}:${P}@/");
-                    echo "USER/PASS: ${URL}";
                   else
                     S="$(oc get secret -n openshift-gitops vp-private-repo-credentials -o go-template='{{index .data.sshPrivateKey | base64decode }}')";
                     mkdir -p --mode 0700 "${HOME}/.ssh";
@@ -461,15 +580,18 @@ spec:
                     chmod 0600 "${HOME}/.ssh/id_rsa";
                     URL=$(echo https://github.com/pattern-clone/mypattern | sed -E "s/(https?:\/\/)/\1git@/");
                     git config --global core.sshCommand "ssh -i "${HOME}/.ssh/id_rsa" -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no";
-                    echo "SSH: ${URL}";
                   fi;
                 fi;
+                OUT="$(oc get proxy.config.openshift.io/cluster -o jsonpath='{.spec.httpProxy}' 2>/dev/null)";
+                if [ -n "${OUT}" ]; then export HTTP_PROXY="${OUT}"; fi;
+                OUT="$(oc get proxy.config.openshift.io/cluster -o jsonpath='{.spec.httpsProxy}' 2>/dev/null)";
+                if [ -n "${OUT}" ]; then export HTTPS_PROXY="${OUT}"; fi;
+                OUT="$(oc get proxy.config.openshift.io/cluster -o jsonpath='{.spec.noProxy}' 2>/dev/null)";
+                if [ -n "${OUT}" ]; then export NO_PROXY="${OUT}"; fi;
+                if [ "main" = "HEAD" ]; then BRANCH=""; else BRANCH="--branch main"; fi;
                 mkdir /git/{repo,home};
-                git clone --single-branch --branch main --depth 1 -- "${URL}" /git/repo;
+                git clone --recurse-submodules --single-branch ${BRANCH} --depth 1 -- "${URL}" /git/repo;
                 chmod 0770 /git/{repo,home};
-              volumeMounts:
-              - name: git
-                mountPath: "/git"
             - name: test
               image: registry.redhat.io/ansible-automation-platform-24/ee-supported-rhel9:latest
               imagePullPolicy: Always
@@ -492,6 +614,14 @@ spec:
                 - name: values-volume
                   mountPath: /values/values.yaml
                   subPath: values.yaml
+                - mountPath: /var/run/kube-root-ca
+                  name: kube-root-ca
+                - mountPath: /var/run/trusted-ca
+                  name: trusted-ca-bundle
+                - mountPath: /var/run/trusted-hub
+                  name: trusted-hub-bundle
+                - mountPath: /tmp/ca-bundles
+                  name: ca-bundles
           containers:            
             - name: "done"
               image: registry.redhat.io/ansible-automation-platform-24/ee-supported-rhel9:latest
@@ -502,12 +632,25 @@ spec:
                 - 'echo'
                 - 'done'
                 - '\n'
-          volumes:
-          - name: git
-            emptyDir: {}
-          - name: values-volume
-            configMap:
-              name: helm-values-configmap-hub
+          volumes:            
+            - name: git
+              emptyDir: {}
+            - name: values-volume
+              configMap:
+                name: helm-values-configmap-hub
+            - configMap:
+                name: kube-root-ca.crt
+              name: kube-root-ca
+            - configMap:
+                name: trusted-ca-bundle
+                optional: true
+              name: trusted-ca-bundle
+            - configMap:
+                name: trusted-hub-bundle
+                optional: true
+              name: trusted-hub-bundle
+            - name: ca-bundles
+              emptyDir: {}
           restartPolicy: Never
 ---
 # Source: clustergroup/templates/imperative/unsealjob.yaml
@@ -531,12 +674,38 @@ spec:
           initContainers:
             # git init happens in /git/repo so that we can set the folder to 0770 permissions
             # reason for that is ansible refuses to create temporary folders in there            
+            - name: fetch-ca
+              image: registry.redhat.io/ansible-automation-platform-24/ee-supported-rhel9:latest
+              imagePullPolicy: Always
+              env:
+                - name: HOME
+                  value: /git/home
+              command:
+              - 'sh'
+              - '-c'
+              - >-
+                cat /var/run/kube-root-ca/ca.crt /var/run/trusted-ca/ca-bundle.crt /var/run/trusted-hub/hub-kube-root-ca.crt > /tmp/ca-bundles/ca-bundle.crt || true;
+                ls -l /tmp/ca-bundles/
+              volumeMounts:
+              - mountPath: /var/run/kube-root-ca
+                name: kube-root-ca
+              - mountPath: /var/run/trusted-ca
+                name: trusted-ca-bundle
+              - mountPath: /var/run/trusted-hub
+                name: trusted-hub-bundle
+              - mountPath: /tmp/ca-bundles
+                name: ca-bundles            
             - name: git-init
               image: registry.redhat.io/ansible-automation-platform-24/ee-supported-rhel9:latest
               imagePullPolicy: Always
               env:
                 - name: HOME
                   value: /git/home
+              volumeMounts:
+              - name: git
+                mountPath: "/git"
+              - name: ca-bundles
+                mountPath: /etc/pki/tls/certs
               command:
               - 'sh'
               - '-c'
@@ -548,7 +717,6 @@ spec:
                     U="$(oc get secret -n openshift-gitops vp-private-repo-credentials -o go-template='{{index .data.username | base64decode }}')";
                     P="$(oc get secret -n openshift-gitops vp-private-repo-credentials -o go-template='{{index .data.password | base64decode }}')";
                     URL=$(echo https://github.com/pattern-clone/mypattern | sed -E "s/(https?:\/\/)/\1${U}:${P}@/");
-                    echo "USER/PASS: ${URL}";
                   else
                     S="$(oc get secret -n openshift-gitops vp-private-repo-credentials -o go-template='{{index .data.sshPrivateKey | base64decode }}')";
                     mkdir -p --mode 0700 "${HOME}/.ssh";
@@ -556,15 +724,18 @@ spec:
                     chmod 0600 "${HOME}/.ssh/id_rsa";
                     URL=$(echo https://github.com/pattern-clone/mypattern | sed -E "s/(https?:\/\/)/\1git@/");
                     git config --global core.sshCommand "ssh -i "${HOME}/.ssh/id_rsa" -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no";
-                    echo "SSH: ${URL}";
                   fi;
                 fi;
+                OUT="$(oc get proxy.config.openshift.io/cluster -o jsonpath='{.spec.httpProxy}' 2>/dev/null)";
+                if [ -n "${OUT}" ]; then export HTTP_PROXY="${OUT}"; fi;
+                OUT="$(oc get proxy.config.openshift.io/cluster -o jsonpath='{.spec.httpsProxy}' 2>/dev/null)";
+                if [ -n "${OUT}" ]; then export HTTPS_PROXY="${OUT}"; fi;
+                OUT="$(oc get proxy.config.openshift.io/cluster -o jsonpath='{.spec.noProxy}' 2>/dev/null)";
+                if [ -n "${OUT}" ]; then export NO_PROXY="${OUT}"; fi;
+                if [ "main" = "HEAD" ]; then BRANCH=""; else BRANCH="--branch main"; fi;
                 mkdir /git/{repo,home};
-                git clone --single-branch --branch main --depth 1 -- "${URL}" /git/repo;
+                git clone --recurse-submodules --single-branch ${BRANCH} --depth 1 -- "${URL}" /git/repo;
                 chmod 0770 /git/{repo,home};
-              volumeMounts:
-              - name: git
-                mountPath: "/git"
             - name: unseal-playbook
               image: registry.redhat.io/ansible-automation-platform-24/ee-supported-rhel9:latest
               imagePullPolicy: Always
@@ -589,6 +760,14 @@ spec:
                 - name: values-volume
                   mountPath: /values/values.yaml
                   subPath: values.yaml
+                - mountPath: /var/run/kube-root-ca
+                  name: kube-root-ca
+                - mountPath: /var/run/trusted-ca
+                  name: trusted-ca-bundle
+                - mountPath: /var/run/trusted-hub
+                  name: trusted-hub-bundle
+                - mountPath: /tmp/ca-bundles
+                  name: ca-bundles
           containers:            
             - name: "done"
               image: registry.redhat.io/ansible-automation-platform-24/ee-supported-rhel9:latest
@@ -599,12 +778,25 @@ spec:
                 - 'echo'
                 - 'done'
                 - '\n'
-          volumes:
-          - name: git
-            emptyDir: {}
-          - name: values-volume
-            configMap:
-              name: helm-values-configmap-hub
+          volumes:            
+            - name: git
+              emptyDir: {}
+            - name: values-volume
+              configMap:
+                name: helm-values-configmap-hub
+            - configMap:
+                name: kube-root-ca.crt
+              name: kube-root-ca
+            - configMap:
+                name: trusted-ca-bundle
+                optional: true
+              name: trusted-ca-bundle
+            - configMap:
+                name: trusted-hub-bundle
+                optional: true
+              name: trusted-hub-bundle
+            - name: ca-bundles
+              emptyDir: {}
           restartPolicy: Never
 ---
 # Source: clustergroup/templates/core/subscriptions.yaml
@@ -673,6 +865,8 @@ spec:
     path: common/golang-external-secrets
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -682,9 +876,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -697,9 +891,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   syncPolicy:
     automated: {}
@@ -727,6 +929,8 @@ spec:
     path: charts/all/kafdrop
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -736,9 +940,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -751,9 +955,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   syncPolicy:
     automated: {}
@@ -781,6 +993,8 @@ spec:
     path: charts/all/kafka
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -790,9 +1004,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -805,9 +1019,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   syncPolicy:
     automated: {}
@@ -835,6 +1057,8 @@ spec:
     path: charts/all/opendatahub
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -844,9 +1068,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -859,9 +1083,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   syncPolicy:
     automated: {}
@@ -889,6 +1121,8 @@ spec:
     path: charts/all/openshift-data-foundations
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -898,9 +1132,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -913,9 +1147,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   syncPolicy:
     automated: {}
@@ -943,6 +1185,8 @@ spec:
     path: charts/all/openshift-serverless
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -952,9 +1196,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -967,9 +1211,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   syncPolicy:
     automated: {}
@@ -997,6 +1249,8 @@ spec:
     path: charts/all/medical-diagnosis/service-account
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -1006,9 +1260,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -1021,9 +1275,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   syncPolicy:
     automated: {}
@@ -1051,6 +1313,8 @@ spec:
     chart: vault
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -1060,9 +1324,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -1075,9 +1339,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
         - name: global.openshift
           value: "true"
@@ -1123,6 +1395,8 @@ spec:
     path: charts/all/medical-diagnosis/database
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -1132,9 +1406,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -1147,9 +1421,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   syncPolicy:
     automated: {}
@@ -1177,6 +1459,8 @@ spec:
     path: charts/all/medical-diagnosis/grafana
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -1186,9 +1470,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -1201,9 +1485,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   syncPolicy:
     automated: {}
@@ -1231,6 +1523,8 @@ spec:
     path: charts/all/medical-diagnosis/image-generator
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -1240,9 +1534,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -1255,9 +1549,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   ignoreDifferences: [
   {
@@ -1294,6 +1596,8 @@ spec:
     path: charts/all/medical-diagnosis/image-server
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -1303,9 +1607,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -1318,9 +1622,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   ignoreDifferences: [
   {
@@ -1357,6 +1669,8 @@ spec:
     path: charts/all/medical-diagnosis/xray-init
     helm:
       ignoreMissingValueFiles: true
+      values: |
+        extraParametersNested:
       valueFiles:
       - "/values-global.yaml"
       - "/values-hub.yaml"
@@ -1366,9 +1680,9 @@ spec:
       - "/values-4.12-hub.yaml" 
       parameters:
         - name: global.repoURL
-          value: $ARGOCD_APP_SOURCE_REPO_URL
+          value: https://github.com/pattern-clone/mypattern
         - name: global.targetRevision
-          value: $ARGOCD_APP_SOURCE_TARGET_REVISION
+          value: main
         - name: global.namespace
           value: $ARGOCD_APP_NAMESPACE
         - name: global.pattern
@@ -1381,9 +1695,17 @@ spec:
           value: "aws"
         - name: global.hubClusterDomain
           value: apps.hub.example.com
+        - name: global.multiSourceSupport
+          value: 
+        - name: global.multiSourceRepoUrl
+          value: 
+        - name: global.multiSourceTargetRevision
+          value: 
         - name: global.localClusterDomain
           value: apps.region.example.com
         - name: global.privateRepo
+          value: 
+        - name: global.experimentalCapabilities
           value: 
   syncPolicy:
     automated: {}
@@ -1391,7 +1713,7 @@ spec:
       limit: 20
 ---
 # Source: clustergroup/templates/plumbing/argocd.yaml
-apiVersion: argoproj.io/v1alpha1
+apiVersion: argoproj.io/v1beta1
 kind: ArgoCD
 metadata:
   finalizers:
@@ -1426,6 +1748,7 @@ spec:
       hs.message = "Waiting for PVC"
       return hs
 
+  resourceTrackingMethod: label
   applicationInstanceLabelKey: argocd.argoproj.io/instance
   applicationSet:
     resources:
@@ -1459,6 +1782,47 @@ spec:
   rbac:
     defaultPolicy: role:admin
   repo:
+    initContainers:
+    - command:
+      - bash
+      - -c
+      - cat /var/run/kube-root-ca/ca.crt /var/run/trusted-ca/ca-bundle.crt /var/run/trusted-hub/hub-kube-root-ca.crt > /tmp/ca-bundles/ca-bundle.crt || true
+      image: registry.redhat.io/ansible-automation-platform-24/ee-supported-rhel9:latest
+      name: fetch-ca
+      resources: {}
+      volumeMounts:
+      - mountPath: /var/run/kube-root-ca
+        name: kube-root-ca
+      - mountPath: /var/run/trusted-ca
+        name: trusted-ca-bundle
+      - mountPath: /var/run/trusted-hub
+        name: trusted-hub-bundle
+      - mountPath: /tmp/ca-bundles
+        name: ca-bundles
+    resources:
+      limits:
+        cpu: "1"
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 256Mi
+    volumeMounts:
+    - mountPath: /etc/pki/tls/certs
+      name: ca-bundles
+    volumes:
+    - configMap:
+        name: kube-root-ca.crt
+      name: kube-root-ca
+    - configMap:
+        name: trusted-ca-bundle
+        optional: true
+      name: trusted-ca-bundle
+    - configMap:
+        name: trusted-hub-bundle
+        optional: true
+      name: trusted-hub-bundle
+    - emptyDir: {}
+      name: ca-bundles
     resources:
       limits:
         cpu: "1"
@@ -1466,7 +1830,7 @@ spec:
       requests:
         cpu: 250m
         memory: 256Mi
-  resourceExclusions: |
+  resourceExclusions:  |
     - apiGroups:
       - tekton.dev
       kinds:
@@ -1523,6 +1887,7 @@ spec:
   - open-cluster-management
 ---
 # Source: clustergroup/templates/core/operatorgroup.yaml
+---
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -1533,6 +1898,7 @@ spec:
   - openshift-serverless
 ---
 # Source: clustergroup/templates/core/operatorgroup.yaml
+---
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -1543,6 +1909,7 @@ spec:
   - opendatahub
 ---
 # Source: clustergroup/templates/core/operatorgroup.yaml
+---
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -1553,6 +1920,7 @@ spec:
   - openshift-storage
 ---
 # Source: clustergroup/templates/core/operatorgroup.yaml
+---
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -1563,6 +1931,7 @@ spec:
   - xraylab-1
 ---
 # Source: clustergroup/templates/core/operatorgroup.yaml
+---
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -1573,6 +1942,7 @@ spec:
   - knative-serving
 ---
 # Source: clustergroup/templates/core/operatorgroup.yaml
+---
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -1583,6 +1953,7 @@ spec:
   - staging
 ---
 # Source: clustergroup/templates/core/operatorgroup.yaml
+---
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
@@ -1593,6 +1964,7 @@ spec:
   - vault
 ---
 # Source: clustergroup/templates/core/operatorgroup.yaml
+---
 apiVersion: operators.coreos.com/v1
 kind: OperatorGroup
 metadata:
